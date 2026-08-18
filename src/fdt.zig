@@ -703,11 +703,37 @@ fn upsertProperty(self: *@This(), path: []const u8, value_bytes: []const u8) !vo
     }
 }
 
+/// The size of the serialized struct block: the sum of what writeListNode()
+/// writes for each node.
+fn dtStructSize(dt_struct: std.DoublyLinkedList) usize {
+    var total: usize = 0;
+    var node = dt_struct.first orelse return total;
+
+    while (true) {
+        const node_data: *Node = @fieldParentPtr("inner", node);
+
+        total += @sizeOf(u32); // token
+        switch (node_data.token) {
+            .BeginNode => |name| {
+                total += name.len + 1 + fdtPad(@intCast(name.len + 1));
+            },
+            .Prop => |prop| {
+                total += @sizeOf(Prop) + prop.value.len + fdtPad(@intCast(prop.value.len));
+            },
+            .EndNode, .Nop, .End => {},
+        }
+
+        node = node.next orelse break;
+    }
+
+    return total;
+}
+
 /// Returns the total size (in bytes) needed to serialize the devicetree to FDT
 /// format. This is useful to call if the FDT is going to be written to a
 /// heap-backed buffer, since the returned value can be used with alloc().
 pub fn size(self: *@This()) usize {
-    return self.header.total_size;
+    return @sizeOf(Header) + (self.header.off_mem_rsvmap - @sizeOf(Header)) + self.mem_rsvmap.len + dtStructSize(self.dt_struct) + self.dt_strings.written().len;
 }
 
 fn writeListNode(writer: *std.Io.Writer, node: *Node.Inner) !void {
@@ -733,9 +759,17 @@ fn writeListNode(writer: *std.Io.Writer, node: *Node.Inner) !void {
 pub fn save(self: *@This(), writer: *std.Io.Writer) !void {
     var node = self.dt_struct.first orelse return error.InvalidFdt;
 
-    try writer.writeStruct(self.header, .big);
+    // Recompute the size-related header fields from the actual content, since
+    // properties may have been added, removed, or changed since parsing.
+    var header = self.header;
+    header.size_dt_struct = @intCast(dtStructSize(self.dt_struct));
+    header.off_dt_strings = header.off_dt_struct + header.size_dt_struct;
+    header.size_dt_strings = @intCast(self.dt_strings.written().len);
+    header.total_size = header.off_dt_strings + header.size_dt_strings;
 
-    try writer.splatByteAll(0, self.header.off_mem_rsvmap - @sizeOf(Header));
+    try writer.writeStruct(header, .big);
+
+    try writer.splatByteAll(0, header.off_mem_rsvmap - @sizeOf(Header));
 
     try writer.writeAll(self.mem_rsvmap);
 
@@ -744,8 +778,7 @@ pub fn save(self: *@This(), writer: *std.Io.Writer) !void {
         node = node.next orelse break;
     }
 
-    try writer.splatByteAll(0, self.header.off_dt_strings - self.header.off_dt_struct - self.header.size_dt_struct);
-
+    // The struct block is followed directly by the strings block.
     try writer.writeAll(self.dt_strings.written());
 }
 
@@ -929,4 +962,34 @@ test "fdt write" {
     // ensure the unique strings we removed don't appear
     try std.testing.expectEqual(null, std.mem.indexOf(u8, buf, "bool"));
     try std.testing.expectEqual(null, std.mem.indexOf(u8, buf, "this_is_a_stringlist"));
+}
+
+test "fdt round trip of qemu virt dtb" {
+    const qemu_dtb = @embedFile("qemu-virt.dtb");
+
+    var reader: std.Io.Reader = .fixed(qemu_dtb);
+
+    var fdt = try Fdt.init(&reader, std.testing.allocator);
+    defer fdt.deinit();
+
+    // Add and change properties, altering the size of the struct block,
+    // which the serializer must account for.
+    try fdt.upsertStringProperty("/chosen/bootargs", "console=ttyAMA0");
+    try fdt.upsertU32Property("/chosen/new_u32", 0x11223344);
+
+    const buf = try std.testing.allocator.alloc(u8, fdt.size());
+    defer std.testing.allocator.free(buf);
+    var writer: std.Io.Writer = .fixed(buf);
+    try fdt.save(&writer);
+    try writer.flush();
+
+    // The serialized device tree must be re-parseable, with the new and
+    // original properties intact.
+    var reader2: std.Io.Reader = .fixed(buf);
+    var fdt2 = try Fdt.init(&reader2, std.testing.allocator);
+    defer fdt2.deinit();
+
+    try std.testing.expectEqualStrings("console=ttyAMA0", try fdt2.getStringProperty("/chosen/bootargs"));
+    try std.testing.expectEqual(0x11223344, try fdt2.getU32Property("/chosen/new_u32"));
+    try std.testing.expectEqualStrings("linux,dummy-virt", try fdt2.getStringProperty("/model"));
 }
