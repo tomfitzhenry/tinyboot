@@ -84,6 +84,10 @@ pub fn init(reader: *std.Io.Reader, allocator: std.mem.Allocator) !@This() {
         return error.IncompatibleVersion;
     }
 
+    // The memory reservation block may not directly follow the header (e.g.
+    // qemu's virt DTB 8-byte-aligns it), so seek to off_mem_rsvmap first.
+    try reader.discardAll(header.off_mem_rsvmap - @sizeOf(Header));
+
     const mem_rsvmap = try reader.readAlloc(allocator, header.off_dt_struct - header.off_mem_rsvmap);
     errdefer allocator.free(mem_rsvmap);
 
@@ -820,6 +824,23 @@ const test_fdt = [_]u8{
     0x5f, 0x61, 0x5f, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x74, 0x68, 0x69, 0x73, 0x5f, 0x69,
     0x73, 0x5f, 0x61, 0x5f, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x6c, 0x69, 0x73, 0x74, 0x00,
 };
+
+test "fdt read of qemu virt dtb" {
+    // A real device tree from qemu's virt machine, which 8-byte-aligns the
+    // memory reservation block (off_mem_rsvmap = 48), leaving padding after
+    // the header that Fdt.init must honour. Captured with:
+    //   qemu-system-arm -machine virt -m 512M -machine dumpdtb=qemu-virt.dtb
+    // (truncated to its real content size).
+    const qemu_dtb = @embedFile("qemu-virt.dtb");
+
+    var reader: std.Io.Reader = .fixed(qemu_dtb);
+
+    var fdt = try Fdt.init(&reader, std.testing.allocator);
+    defer fdt.deinit();
+
+    try std.testing.expectEqualStrings("linux,dummy-virt", try fdt.getStringProperty("/model"));
+    try std.testing.expectEqualStrings("hvc", try fdt.getStringProperty("/psci/method"));
+}
 
 test "fdt read" {
     var reader: std.Io.Reader = .fixed(&test_fdt);
