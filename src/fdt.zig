@@ -685,18 +685,20 @@ fn upsertProperty(self: *@This(), path: []const u8, value_bytes: []const u8) !vo
         std.debug.assert(node_data.token == .Prop);
         switch (node_data.token) {
             .Prop => |*prop| {
+                const old_value_len = prop.inner.len;
                 self.allocator.free(prop.value); // free old value
 
                 prop.value = value_bytes;
+                prop.inner.len = @intCast(value_bytes.len);
 
-                const struct_bytes_diff: u32 = @intCast(
-                    value_bytes.len + fdtPad(@intCast(value_bytes.len)) // new value plus padding
-                    - (prop.value.len + fdtPad(@intCast(prop.value.len))), // old value plus padding
+                const struct_bytes_diff: i32 = @intCast(
+                    @as(i64, @intCast(value_bytes.len)) + fdtPad(@intCast(value_bytes.len)) // new value plus padding
+                    - (@as(i64, @intCast(old_value_len)) + fdtPad(old_value_len)), // old value plus padding
                 );
 
-                self.header.size_dt_struct += struct_bytes_diff;
-                self.header.off_dt_strings += struct_bytes_diff;
-                self.header.total_size += struct_bytes_diff;
+                self.header.size_dt_struct +%= @bitCast(struct_bytes_diff);
+                self.header.off_dt_strings +%= @bitCast(struct_bytes_diff);
+                self.header.total_size +%= @bitCast(struct_bytes_diff);
             },
             else => unreachable,
         }
@@ -991,5 +993,37 @@ test "fdt round trip of qemu virt dtb" {
 
     try std.testing.expectEqualStrings("console=ttyAMA0", try fdt2.getStringProperty("/chosen/bootargs"));
     try std.testing.expectEqual(0x11223344, try fdt2.getU32Property("/chosen/new_u32"));
+    try std.testing.expectEqualStrings("linux,dummy-virt", try fdt2.getStringProperty("/model"));
+}
+
+test "fdt upsert replacement of qemu's 2-cell initrd properties" {
+    const qemu_dtb = @embedFile("qemu-virt.dtb");
+
+    var reader: std.Io.Reader = .fixed(qemu_dtb);
+
+    var fdt = try Fdt.init(&reader, std.testing.allocator);
+    defer fdt.deinit();
+
+    // qemu writes the first kernel's initrd location into /chosen at boot as
+    // 2-cell properties (len 8), which tboot-loader then replaces with its
+    // own 1-cell values (len 4). The replace must update the property length.
+    try fdt.upsertU64Property("/chosen/linux,initrd-start", @as(u64, 0x40a6c000) << 32);
+    try fdt.upsertU64Property("/chosen/linux,initrd-end", @as(u64, 0x40b24000) << 32);
+
+    try fdt.upsertU32Property("/chosen/linux,initrd-start", 0x40864000);
+    try fdt.upsertU32Property("/chosen/linux,initrd-end", 0x40a84000);
+
+    const buf = try std.testing.allocator.alloc(u8, fdt.size());
+    defer std.testing.allocator.free(buf);
+    var writer: std.Io.Writer = .fixed(buf);
+    try fdt.save(&writer);
+    try writer.flush();
+
+    var reader2: std.Io.Reader = .fixed(buf);
+    var fdt2 = try Fdt.init(&reader2, std.testing.allocator);
+    defer fdt2.deinit();
+
+    try std.testing.expectEqual(0x40864000, try fdt2.getU32Property("/chosen/linux,initrd-start"));
+    try std.testing.expectEqual(0x40a84000, try fdt2.getU32Property("/chosen/linux,initrd-end"));
     try std.testing.expectEqualStrings("linux,dummy-virt", try fdt2.getStringProperty("/model"));
 }
