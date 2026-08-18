@@ -36,6 +36,7 @@ const ZimageTag = extern struct {
         krnl_size: extern struct {
             size_ptr: u32,
             bss_size: u32,
+            text_offset: u32,
         },
     },
 };
@@ -153,7 +154,7 @@ pub fn kexecLoad(
 
     std.log.debug("resulting kernel space: 0x{x}", .{uncompressed_kernel_size});
 
-    const extra_size = 0x8000; // TEXT_OFFSET
+    const extra_size = zimageTextOffset(hdr, kernel_buf, kernel_size); // TEXT_OFFSET
 
     const proc_iomem = try std.Io.Dir.cwd().openFile(io, "/proc/iomem", .{});
     defer proc_iomem.close(io);
@@ -608,4 +609,96 @@ fn findExtensionTag(
     }
 
     return null;
+}
+
+/// The zImage's TEXT_OFFSET, read from the KRNL_SIZE tag table when it
+/// carries one (Linux v5.10+, commit 83dfeedb6663, "ARM: add TEXT_OFFSET to
+/// decompressor kexec image structure"; the table itself is from v4.15,
+/// c772568788b5). The decompressor places the inflated kernel at TEXT_OFFSET,
+/// so the zImage — and everything placed relative to it — must use the real
+/// value. Falls back to the historical 0x8000 default.
+fn zimageTextOffset(hdr: *ZimageHeader, kernel_buf: []u8, kernel_size: u32) u32 {
+    const tag = findExtensionTag(hdr, kernel_buf, kernel_size, ZimageTag.KRNL_SIZE) catch null orelse {
+        std.log.warn("zImage has no KRNL_SIZE tag; assuming TEXT_OFFSET 0x8000", .{});
+        return 0x8000;
+    };
+
+    if (byteSize(tag) < 5 * @sizeOf(u32)) {
+        std.log.warn("zImage tag table predates TEXT_OFFSET; assuming 0x8000", .{});
+        return 0x8000;
+    }
+
+    return tag.u.krnl_size.text_offset;
+}
+
+/// Build a synthetic zImage: header + optional KRNL_SIZE tag table + 4-byte
+/// tail pad (mirrors "Always extend the zImage by four bytes" above).
+fn makeTestZimage(buf: []u8, tag_words: ?[]const u32) void {
+    @memset(buf, 0);
+
+    var offset: usize = 0;
+    // instr[9] — contents irrelevant to the tag scan
+    for (0..9) |_| {
+        std.mem.writeInt(u32, buf[offset..][0..4], 0x00000000, .little);
+        offset += 4;
+    }
+    std.mem.writeInt(u32, buf[offset..][0..4], ZIMAGE_MAGIC, .little);
+    offset += 4; // magic
+    std.mem.writeInt(u32, buf[offset..][0..4], 0, .little);
+    offset += 4; // start
+    std.mem.writeInt(u32, buf[offset..][0..4], @intCast(buf.len), .little);
+    offset += 4; // end
+    std.mem.writeInt(u32, buf[offset..][0..4], 0, .little);
+    offset += 4; // endian (irrelevant to the tag scan)
+    std.mem.writeInt(u32, buf[offset..][0..4], ZIMAGE_MAGIC2, .little);
+    offset += 4; // magic2
+    std.mem.writeInt(
+        u32,
+        buf[offset..][0..4],
+        if (tag_words != null) @sizeOf(ZimageHeader) else 0,
+        .little,
+    );
+    offset += 4; // extension_tag_offset
+
+    if (tag_words) |words| {
+        for (words) |word| {
+            std.mem.writeInt(u32, buf[offset..][0..4], word, .little);
+            offset += 4;
+        }
+    }
+}
+
+test "zImage TEXT_OFFSET is read from the KRNL_SIZE tag" {
+    // The v5.10+ table carries text_offset as a third word past size_ptr and
+    // bss_size (5 words total including the tag header).
+    var buf: [@sizeOf(ZimageHeader) + 5 * 4 + 4]u8 align(@alignOf(ZimageHeader)) = undefined;
+    makeTestZimage(&buf, &.{ 5, ZimageTag.KRNL_SIZE, 80, 0, 0x00208000 });
+
+    const hdr: *ZimageHeader = @ptrCast(@alignCast(&buf));
+    try std.testing.expectEqual(@as(u32, 0x00208000), zimageTextOffset(hdr, &buf, buf.len));
+}
+
+test "zImage TEXT_OFFSET of zero is preserved" {
+    var buf: [@sizeOf(ZimageHeader) + 5 * 4 + 4]u8 align(@alignOf(ZimageHeader)) = undefined;
+    makeTestZimage(&buf, &.{ 5, ZimageTag.KRNL_SIZE, 80, 0, 0 });
+
+    const hdr: *ZimageHeader = @ptrCast(@alignCast(&buf));
+    try std.testing.expectEqual(@as(u32, 0), zimageTextOffset(hdr, &buf, buf.len));
+}
+
+test "zImage TEXT_OFFSET falls back to 0x8000 for pre-v5.10 tag tables" {
+    // Tag tables from v4.15..v5.10 only carried size_ptr + bss_size.
+    var buf: [@sizeOf(ZimageHeader) + 4 * 4 + 4]u8 align(@alignOf(ZimageHeader)) = undefined;
+    makeTestZimage(&buf, &.{ 4, ZimageTag.KRNL_SIZE, 80, 0 });
+
+    const hdr: *ZimageHeader = @ptrCast(@alignCast(&buf));
+    try std.testing.expectEqual(@as(u32, 0x8000), zimageTextOffset(hdr, &buf, buf.len));
+}
+
+test "zImage TEXT_OFFSET falls back to 0x8000 without a tag table" {
+    var buf: [@sizeOf(ZimageHeader) + 4]u8 align(@alignOf(ZimageHeader)) = undefined;
+    makeTestZimage(&buf, null);
+
+    const hdr: *ZimageHeader = @ptrCast(@alignCast(&buf));
+    try std.testing.expectEqual(@as(u32, 0x8000), zimageTextOffset(hdr, &buf, buf.len));
 }
