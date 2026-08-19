@@ -52,6 +52,15 @@
           ymodem = pkgs.callPackage ./tests/ymodem { };
           tinybootNative = pkgs.tinyboot;
         }
+        // inputs.nixpkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.isx86_64) {
+          # arm32 runtime test under qemu software emulation: tboot-loader
+          # kexecs a kernel with TEXT_OFFSET=0x208000 from a BLS fat drive.
+          arm32 = pkgs.callPackage ./tests/arm32 {
+            tboot = pkgs.pkgsCross.armv7l-hf-multiplatform.tinyboot;
+            tinybootNative = pkgs.tinyboot;
+            zig = inputs.zig-overlay.packages.${pkgs.stdenv.hostPlatform.system}.master-2026-06-22;
+          };
+        }
         // listToAttrs (
           map
             (
